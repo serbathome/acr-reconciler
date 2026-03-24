@@ -13,9 +13,11 @@ import (
 )
 
 type Registry struct {
-	Name        string
-	LoginServer string
-	Repos       []Repo
+	Name          string
+	LoginServer   string
+	ResourceGroup string
+	ResourceID    string
+	Repos         []Repo
 }
 
 type Repo struct {
@@ -113,19 +115,135 @@ func printUniqueTags(registries []Registry, repoFilter string) {
 	}
 }
 
+// populateRepos fetches all repositories and their tags for the given registry.
+func populateRepos(ctx context.Context, cred *azidentity.DefaultAzureCredential, reg *Registry) error {
+	client, err := azcontainerregistry.NewClient("https://"+reg.LoginServer, cred, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create client for %s: %w", reg.Name, err)
+	}
+	repoPager := client.NewListRepositoriesPager(nil)
+	for repoPager.More() {
+		page, err := repoPager.NextPage(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to list repositories for %s: %w", reg.Name, err)
+		}
+		for _, name := range page.Names {
+			repo := Repo{Name: *name}
+			tagPager := client.NewListTagsPager(*name, nil)
+			for tagPager.More() {
+				tagPage, err := tagPager.NextPage(ctx)
+				if err != nil {
+					return fmt.Errorf("failed to list tags for %s/%s: %w", reg.Name, *name, err)
+				}
+				for _, tag := range tagPage.Tags {
+					repo.Tags = append(repo.Tags, *tag.Name)
+				}
+			}
+			reg.Repos = append(reg.Repos, repo)
+		}
+	}
+	return nil
+}
+
+// findRegistryByName looks up a registry by name in the subscription and returns a Registry
+// with Name, LoginServer, and ResourceGroup populated.
+func findRegistryByName(ctx context.Context, armClient *armcontainerregistry.RegistriesClient, name string) (Registry, error) {
+	pager := armClient.NewListPager(nil)
+	for pager.More() {
+		page, err := pager.NextPage(ctx)
+		if err != nil {
+			return Registry{}, fmt.Errorf("failed to list registries: %w", err)
+		}
+		for _, r := range page.Value {
+			if strings.EqualFold(*r.Name, name) {
+				parts := strings.Split(*r.ID, "/")
+				rg := ""
+				if len(parts) > 4 {
+					rg = parts[4]
+				}
+				return Registry{
+					Name:          *r.Name,
+					LoginServer:   *r.Properties.LoginServer,
+					ResourceGroup: rg,
+					ResourceID:    *r.ID,
+				}, nil
+			}
+		}
+	}
+	return Registry{}, fmt.Errorf("registry %q not found in subscription", name)
+}
+
+// performSync imports images present in source but missing in target.
+func performSync(ctx context.Context, armClient *armcontainerregistry.RegistriesClient, source, target Registry, repoFilter string, dryRun bool) error {
+	targetIndex := make(map[string]map[string]bool)
+	for _, repo := range target.Repos {
+		targetIndex[repo.Name] = make(map[string]bool)
+		for _, tag := range repo.Tags {
+			targetIndex[repo.Name][tag] = true
+		}
+	}
+
+	var count int
+	noForce := armcontainerregistry.ImportModeNoForce
+	for _, repo := range filterRepos(source.Repos, repoFilter) {
+		for _, tag := range repo.Tags {
+			if targetIndex[repo.Name][tag] {
+				continue
+			}
+			ref := repo.Name + ":" + tag
+			if dryRun {
+				fmt.Printf("[dry-run] would import %s/%s -> %s/%s\n", source.Name, ref, target.Name, ref)
+				count++
+				continue
+			}
+			fmt.Printf("importing %s/%s -> %s/%s\n", source.Name, ref, target.Name, ref)
+			poller, err := armClient.BeginImportImage(ctx, target.ResourceGroup, target.Name, armcontainerregistry.ImportImageParameters{
+				Source: &armcontainerregistry.ImportSource{
+					ResourceID:  &source.ResourceID,
+					SourceImage: &ref,
+				},
+				TargetTags: []*string{&ref},
+				Mode:       &noForce,
+			}, nil)
+			if err != nil {
+				return fmt.Errorf("failed to start import of %s: %w", ref, err)
+			}
+			if _, err = poller.PollUntilDone(ctx, nil); err != nil {
+				return fmt.Errorf("failed to import %s: %w", ref, err)
+			}
+			count++
+		}
+	}
+	if count == 0 {
+		fmt.Println("nothing to sync")
+	} else if dryRun {
+		fmt.Printf("%d image(s) would be imported\n", count)
+	} else {
+		fmt.Printf("%d image(s) imported\n", count)
+	}
+	return nil
+}
+
 func main() {
 	subscription := flag.String("subscription", "", "Azure subscription ID or name")
-	action := flag.String("action", "", "Action to perform: list, common-tags, unique-tags")
+	action := flag.String("action", "", "Action to perform: list, common-tags, unique-tags, sync")
 	repository := flag.String("repository", "all", "Repository to filter by, or 'all'")
 	registry := flag.String("registry", "", "Comma-separated registry names; omit to discover all in the subscription")
+	sourceRegistry := flag.String("source-registry", "", "Source registry name (required for sync)")
+	targetRegistry := flag.String("target-registry", "", "Target registry name (required for sync)")
+	dryRun := flag.Bool("dry-run", false, "Print what would be imported without making changes (sync only)")
 	flag.Parse()
 
 	if *subscription == "" {
 		fmt.Fprintln(os.Stderr, "error: --subscription is required")
 		os.Exit(1)
 	}
-	if *action != "list" && *action != "common-tags" && *action != "unique-tags" {
-		fmt.Fprintln(os.Stderr, "error: --action must be one of: list, common-tags, unique-tags")
+	if *action != "list" && *action != "common-tags" && *action != "unique-tags" && *action != "sync" {
+		fmt.Fprintln(os.Stderr, "error: --action must be one of: list, common-tags, unique-tags, sync")
+		os.Exit(1)
+	}
+	if *action == "sync" && (*sourceRegistry == "" || *targetRegistry == "") {
+		fmt.Fprintln(os.Stderr, "error: --source-registry and --target-registry are required for sync")
 		os.Exit(1)
 	}
 
@@ -135,73 +253,65 @@ func main() {
 		os.Exit(1)
 	}
 
+	armClient, err := armcontainerregistry.NewRegistriesClient(*subscription, cred, nil)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: failed to create registries client: %v\n", err)
+		os.Exit(1)
+	}
+
+	ctx := context.Background()
 	var registries []Registry
 
-	if *registry != "" {
-		for _, name := range strings.Split(*registry, ",") {
-			if name = strings.TrimSpace(name); name != "" {
-				registries = append(registries, Registry{Name: name, LoginServer: name + ".azurecr.io"})
-			}
-		}
-	} else {
-		armClient, err := armcontainerregistry.NewRegistriesClient(*subscription, cred, nil)
+	switch *action {
+	case "sync":
+		source, err := findRegistryByName(ctx, armClient, *sourceRegistry)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "error: failed to create registries client: %v\n", err)
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)
 		}
-		pager := armClient.NewListPager(nil)
-		for pager.More() {
-			page, err := pager.NextPage(context.Background())
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "error: failed to list registries: %v\n", err)
-				os.Exit(1)
-			}
-			for _, r := range page.Value {
-				registries = append(registries, Registry{
-					Name:        *r.Name,
-					LoginServer: *r.Properties.LoginServer,
-				})
-			}
-		}
-	}
-
-	if len(registries) == 0 {
-		fmt.Fprintln(os.Stderr, "error: no registries found")
-		os.Exit(1)
-	}
-	if len(registries) == 1 && (*action == "common-tags" || *action == "unique-tags") {
-		fmt.Fprintf(os.Stderr, "error: %q requires at least 2 registries, got 1 (%s)\n", *action, registries[0].Name)
-		os.Exit(1)
-	}
-
-	for i, reg := range registries {
-		client, err := azcontainerregistry.NewClient("https://"+reg.LoginServer, cred, nil)
+		target, err := findRegistryByName(ctx, armClient, *targetRegistry)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "error: failed to create client for %s: %v\n", reg.Name, err)
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)
 		}
-		repoPager := client.NewListRepositoriesPager(nil)
-		for repoPager.More() {
-			page, err := repoPager.NextPage(context.Background())
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "error: failed to list repositories for %s: %v\n", reg.Name, err)
-				os.Exit(1)
-			}
-			for _, name := range page.Names {
-				repo := Repo{Name: *name}
-				tagPager := client.NewListTagsPager(*name, nil)
-				for tagPager.More() {
-					tagPage, err := tagPager.NextPage(context.Background())
-					if err != nil {
-						fmt.Fprintf(os.Stderr, "error: failed to list tags for %s/%s: %v\n", reg.Name, *name, err)
-						os.Exit(1)
-					}
-					for _, tag := range tagPage.Tags {
-						repo.Tags = append(repo.Tags, *tag.Name)
-					}
+		registries = []Registry{source, target}
+	default:
+		if *registry != "" {
+			for _, name := range strings.Split(*registry, ",") {
+				if name = strings.TrimSpace(name); name != "" {
+					registries = append(registries, Registry{Name: name, LoginServer: name + ".azurecr.io"})
 				}
-				registries[i].Repos = append(registries[i].Repos, repo)
 			}
+		} else {
+			pager := armClient.NewListPager(nil)
+			for pager.More() {
+				page, err := pager.NextPage(ctx)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "error: failed to list registries: %v\n", err)
+					os.Exit(1)
+				}
+				for _, r := range page.Value {
+					registries = append(registries, Registry{
+						Name:        *r.Name,
+						LoginServer: *r.Properties.LoginServer,
+					})
+				}
+			}
+		}
+		if len(registries) == 0 {
+			fmt.Fprintln(os.Stderr, "error: no registries found")
+			os.Exit(1)
+		}
+		if len(registries) == 1 && (*action == "common-tags" || *action == "unique-tags") {
+			fmt.Fprintf(os.Stderr, "error: %q requires at least 2 registries, got 1 (%s)\n", *action, registries[0].Name)
+			os.Exit(1)
+		}
+	}
+
+	for i := range registries {
+		if err := populateRepos(ctx, cred, &registries[i]); err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
 		}
 	}
 
@@ -212,5 +322,10 @@ func main() {
 		printCommonTags(registries, *repository)
 	case "unique-tags":
 		printUniqueTags(registries, *repository)
+	case "sync":
+		if err := performSync(ctx, armClient, registries[0], registries[1], *repository, *dryRun); err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
 	}
 }
